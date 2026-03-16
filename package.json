@@ -47,7 +47,7 @@
     "eslint": "eslint --ignore-path .eslintignore .",
     "format": "prettier --write .",
     "lint": "npx concurrently --max-processes=50% \"npm:eslint\" \"npm:prettier\"",
-    "prepare": "husky",
+    "prepare": "npm run build",
     "prettier": "prettier --check .",
     "release": "release-it --only-version",
     "test": "jest --runInBand --forceExit --detectOpenHandles",
