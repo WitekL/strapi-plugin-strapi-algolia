@@ -2,6 +2,8 @@ import type { Core, UID } from '@strapi/strapi';
 import Koa from 'koa';
 import { StrapiAlgoliaConfig } from '../../../utils/config';
 
+const BATCH_SIZE = 200;
+
 export default ({ strapi }: { strapi: Core.Strapi }) => ({
   async index(
     ctx: Koa.Context & {
@@ -63,52 +65,86 @@ export default ({ strapi }: { strapi: Core.Strapi }) => ({
 
     const allLocales =
       await strapi.plugins?.i18n?.services?.locales?.find();
-    const localeFilter = allLocales?.map(
-      (locale: any) => locale.code
-    );
-    const findManyBaseOptions = {
-      populate,
-    };
-    const findManyOptions = localeFilter
-      ? {
-          ...findManyBaseOptions,
-          locale: localeFilter,
-        }
-      : { ...findManyBaseOptions };
+    const localeFilter = allLocales?.map((locale: any) => locale.code);
 
-    // Can't fetch draft & published articles in the same query (no status filter = draft only)
-    const publishedArticlesStrapi =
-      (await strapi
-        .documents(name as UID.ContentType)
-        .findMany({ ...findManyOptions, status: 'published' })) ?? [];
-    const draftArticlesStrapi =
-      (await strapi
-        .documents(name as UID.ContentType)
-        .findMany({ ...findManyOptions, status: 'draft' })) ?? [];
-    // Concatenate all published articles + any draft versions which aren't published
-    // Filtering out any draft articles which have a published version
-    const articlesStrapi = publishedArticlesStrapi.concat(
-      draftArticlesStrapi.filter(
-        (draft: any) =>
-          !publishedArticlesStrapi.some(
-            (published: any) => published.id === draft.id
-          )
-      )
-    );
+    const baseFindManyOptions: any = { populate };
+    if (localeFilter) {
+      baseFindManyOptions.locale = localeFilter;
+    }
 
-    await strapiService.afterUpdateAndCreateAlreadyPopulate(
-      body.name,
-      articlesStrapi,
-      idPrefix,
-      client,
-      indexName,
-      transformToBooleanFields,
-      hideFields,
-      transformerCallback
-    );
+    let totalProcessed = 0;
+    const seenPublishedIds = new Set<string>();
+
+    // Process published articles in batches
+    let page = 0;
+    for (;;) {
+      const batch = await strapi
+        .documents(name as UID.ContentType)
+        .findMany({
+          ...baseFindManyOptions,
+          status: 'published',
+          limit: BATCH_SIZE,
+          offset: page * BATCH_SIZE,
+        }) ?? [];
+
+      if (!batch.length) break;
+
+      // Track published IDs to filter drafts later
+      batch.forEach((article: any) => seenPublishedIds.add(article.id));
+
+      await strapiService.afterUpdateAndCreateAlreadyPopulate(
+        body.name,
+        batch,
+        idPrefix,
+        client,
+        indexName,
+        transformToBooleanFields,
+        hideFields,
+        transformerCallback
+      );
+
+      totalProcessed += batch.length;
+      page += 1;
+    }
+
+    // Process draft articles (only those without published versions)
+    page = 0;
+    for (;;) {
+      const batch = await strapi
+        .documents(name as UID.ContentType)
+        .findMany({
+          ...baseFindManyOptions,
+          status: 'draft',
+          limit: BATCH_SIZE,
+          offset: page * BATCH_SIZE,
+        }) ?? [];
+
+      if (!batch.length) break;
+
+      // Filter out drafts that have published versions
+      const draftsOnly = batch.filter(
+        (draft: any) => !seenPublishedIds.has(draft.id)
+      );
+
+      if (draftsOnly.length > 0) {
+        await strapiService.afterUpdateAndCreateAlreadyPopulate(
+          body.name,
+          draftsOnly,
+          idPrefix,
+          client,
+          indexName,
+          transformToBooleanFields,
+          hideFields,
+          transformerCallback
+        );
+        totalProcessed += draftsOnly.length;
+      }
+
+      page += 1;
+    }
 
     return ctx.send({
-      message: `Indexing articles type ${name} to index ${indexName}`,
+      message: `Indexing articles type ${name} to index ${indexName} finished. Processed ${totalProcessed} records in batches of ${BATCH_SIZE}.`,
     });
   },
 });
